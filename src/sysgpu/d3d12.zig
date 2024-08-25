@@ -276,7 +276,6 @@ pub const Adapter = struct {
             }
         }
 
-
         return error.NoAdapterFound;
     }
 
@@ -1406,8 +1405,6 @@ pub const SwapChain = struct {
     buffer_index: u32 = 0,
 
     pub fn init(device: *Device, surface: *Surface, desc: *const sysgpu.SwapChain.Descriptor) !*SwapChain {
-        std.debug.print("Init swap chain\n", .{});
-
         const instance = device.adapter.instance;
         const dxgi_factory = instance.dxgi_factory;
         var hr: c.HRESULT = undefined;
