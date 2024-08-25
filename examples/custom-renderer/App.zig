@@ -1,4 +1,3 @@
-const std = @import("std");
 const mach = @import("mach");
 const math = mach.math;
 const Renderer = @import("Renderer.zig");
@@ -23,9 +22,10 @@ pub const components = .{
 };
 
 pub const systems = .{
+    .start = .{ .handler = start },
     .init = .{ .handler = init },
     .deinit = .{ .handler = deinit },
-    .update = .{ .handler = update },
+    .tick = .{ .handler = tick },
 };
 
 // Define the globally unique name of our module. You can use any name here, but keep in mind no
@@ -38,8 +38,19 @@ pub const name = .app;
 // Note that Mod.state() returns an instance of our module struct.
 pub const Mod = mach.Mod(@This());
 
-pub fn deinit(renderer: *Renderer.Mod) void {
+pub fn deinit(core: *mach.Core.Mod, renderer: *Renderer.Mod) void {
     renderer.schedule(.deinit);
+    core.schedule(.deinit);
+}
+
+fn start(
+    core: *mach.Core.Mod,
+    renderer: *Renderer.Mod,
+    app: *Mod,
+) !void {
+    core.schedule(.init);
+    renderer.schedule(.init);
+    app.schedule(.init);
 }
 
 fn init(
@@ -47,10 +58,12 @@ fn init(
     // of the program we can have these types injected here, letting us work with other modules in
     // our program seamlessly and with a type-safe API:
     entities: *mach.Entities.Mod,
+    core: *mach.Core.Mod,
     renderer: *Renderer.Mod,
-    game: *Mod,
+    app: *Mod,
 ) !void {
-    renderer.schedule(.init);
+    core.state().on_tick = app.system(.tick);
+    core.state().on_exit = app.system(.deinit);
 
     // Create our player entity.
     const player = try entities.new();
@@ -66,26 +79,26 @@ fn init(
     try renderer.set(player, .scale, 1.0);
 
     // Initialize our game module's state - these are the struct fields defined at the top of this
-    // file. If this is not done, then game.state() will panic indicating the state was never
+    // file. If this is not done, then app.state() will panic indicating the state was never
     // initialized.
-    game.init(.{
+    app.init(.{
         .timer = try mach.Timer.start(),
         .spawn_timer = try mach.Timer.start(),
         .player = player,
     });
+
+    core.schedule(.start);
 }
 
-fn update(
+fn tick(
     entities: *mach.Entities.Mod,
     core: *mach.Core.Mod,
     renderer: *Renderer.Mod,
-    game: *Mod,
+    app: *Mod,
 ) !void {
-    // TODO(important): event polling should occur in mach.Core module and get fired as ECS event.
-    // TODO(Core)
     var iter = core.state().pollEvents();
-    var direction = game.state().direction;
-    var spawning = game.state().spawning;
+    var direction = app.state().direction;
+    var spawning = app.state().spawning;
     while (iter.next()) |event| {
         switch (event) {
             .key_press => |ev| {
@@ -116,18 +129,18 @@ fn update(
     // Keep track of which direction we want the player to move based on input, and whether we want
     // to be spawning entities.
     //
-    // Note that game.state() simply returns a pointer to a global singleton of the struct defined
+    // Note that app.state() simply returns a pointer to a global singleton of the struct defined
     // by this file, so we can access fields defined at the top of this file.
-    game.state().direction = direction;
-    game.state().spawning = spawning;
+    app.state().direction = direction;
+    app.state().spawning = spawning;
 
     // Get the current player position
-    var player_pos = renderer.get(game.state().player, .position).?;
+    var player_pos = renderer.get(app.state().player, .position).?;
 
     // If we want to spawn new entities, then spawn them now. The timer just makes spawning rate
     // independent of frame rate.
-    if (spawning and game.state().spawn_timer.read() > 1.0 / 60.0) {
-        _ = game.state().spawn_timer.lap(); // Reset the timer
+    if (spawning and app.state().spawn_timer.read() > 1.0 / 60.0) {
+        _ = app.state().spawn_timer.lap(); // Reset the timer
         for (0..5) |_| {
             // Spawn a new entity at the same position as the player, but smaller in scale.
             const new_entity = try entities.new();
@@ -135,19 +148,19 @@ fn update(
             try renderer.set(new_entity, .scale, 1.0 / 6.0);
 
             // Tag the entity as one that follows the player
-            try game.set(new_entity, .follower, {});
+            try app.set(new_entity, .follower, {});
         }
     }
 
     // Multiply by delta_time to ensure that movement is the same speed regardless of the frame rate.
-    const delta_time = game.state().timer.lap();
+    const delta_time = app.state().timer.lap();
 
     // Calculate the player position, by moving in the direction the player wants to go
     // by the speed amount.
     const speed = 1.0;
     player_pos.v[0] += direction.x() * speed * delta_time;
     player_pos.v[1] += direction.y() * speed * delta_time;
-    try renderer.set(game.state().player, .position, player_pos);
+    try renderer.set(app.state().player, .position, player_pos);
 
     // Query all the entities that have the .follower tag indicating they should follow the player.
     // TODO(important): better querying API

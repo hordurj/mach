@@ -12,13 +12,26 @@ pub const sysjs = @import("mach-sysjs");
 pub const Timer = @import("core/Timer.zig");
 const Frequency = @import("core/Frequency.zig");
 
-const Platform = switch (build_options.core_platform) {
-    .x11 => @import("core/X11.zig"),
-    .wayland => @import("core/Wayland.zig"),
-    .web => @panic("TODO: revive wasm backend"),
+pub const Platform = switch (build_options.core_platform) {
+    .wasm => @panic("TODO: support mach.Core WASM platform"),
     .win32 => @import("core/win32.zig"),
+    .darwin => @import("core/Darwin.zig"),
     .null => @import("core/Null.zig"),
 };
+
+// Whether or not you can drive the main loop in a non-blocking fashion, or if the underlying
+// platform must take control and drive the main loop itself.
+pub const supports_non_blocking = switch (build_options.core_platform) {
+    .win32 => true,
+    .wasm => false,
+    .darwin => false,
+    .null => false,
+};
+
+/// Set this to true if you intend to drive the main loop yourself.
+///
+/// A panic will occur if `supports_non_blocking == false` for the platform.
+pub var non_blocking = false;
 
 pub const name = .mach_core;
 
@@ -26,7 +39,18 @@ pub const Mod = mach.Mod(@This());
 
 pub const systems = .{
     .init = .{ .handler = init, .description = 
-    \\ Send this once you've configured any options you want on e.g. the core.state().main_window
+    \\ Initialize mach.Core
+    },
+
+    .start = .{ .handler = start, .description = 
+    \\ Indicates mach.Core should start its loop and begin scheduling your .app.tick system to run.
+    \\
+    \\ You should register core.state().on_tick and core.state().on_exit callbacks before scheduling
+    \\ this to run.
+    },
+
+    .update = .{ .handler = update, .description = 
+    \\ TODO
     },
 
     .present_frame = .{ .handler = presentFrame, .description = 
@@ -36,14 +60,27 @@ pub const systems = .{
     .exit = .{ .handler = exit, .description = 
     \\ Send this when you would like to exit the application.
     \\
-    \\ When the next .present_frame occurs, then .app.deinit will be sent giving your app a chance
-    \\ to deinitialize itself and .app.tick will no longer be sent. Once your app is done with
-    \\ deinitialization, you should send the final .mach_core.deinit event which will cause the
-    \\ application to finish.
+    \\ When the next .present_frame runs, then core.state().on_exit will be scheduled to run giving
+    \\ your app a chance to deinitialize itself after the last frame has been rendered, and
+    \\ core.state().on_tick will no longer be sent.
+    \\
+    \\ When core.state().on_exit runs, it must schedule .mach_core.deinit to run which will cause
+    \\ the app to finish.
     },
 
     .deinit = .{ .handler = deinit, .description = 
-    \\ Send this once your app is fully deinitialized and ready to exit for good.
+    \\ Send this once your app is fully deinitialized and you are ready for mach.Core to exit for
+    \\ good.
+    },
+
+    .started = .{ .handler = fn () void, .description = 
+    \\ An interrupt signal that mach.Core sends once it has started. This is an interrupt signal to
+    \\ be used by the application entrypoint.
+    },
+
+    .frame_finished = .{ .handler = fn () void, .description = 
+    \\ An interrupt signal that mach.Core sends once a frame has been finished. This is an interrupt
+    \\ signal to be used by the application entrypoint.
     },
 };
 
@@ -84,11 +121,20 @@ pub const components = .{
     },
 };
 
+// Callback systems
+on_tick: ?mach.AnySystem = null,
+on_exit: ?mach.AnySystem = null,
+
 allocator: std.mem.Allocator,
 main_window: mach.EntityID,
 platform: Platform,
 title: [256:0]u8 = undefined,
-should_close: bool = false,
+state: enum {
+    running,
+    exiting,
+    deinitializing,
+    exited,
+} = .running,
 linux_gamemode: ?bool = null,
 frame: Frequency,
 
@@ -113,6 +159,7 @@ pub const EventIterator = struct {
     }
 };
 
+// TODO: this needs to be removed.
 pub const InitOptions = struct {
     allocator: std.mem.Allocator,
     is_app: bool = false,
@@ -129,20 +176,53 @@ pub const InitOptions = struct {
     },
 };
 
-fn init(core: *Mod, entities: *mach.Entities.Mod, options: InitOptions) !void {
-    try mach.sysgpu.Impl.init(options.allocator, .{});
-    const state = core.state();
+fn update(core: *Mod, entities: *mach.Entities.Mod) !void {
+    _ = core;
+    _ = entities;
+}
 
-    state.allocator = options.allocator;
-    state.main_window = try entities.new();
-    try core.set(state.main_window, .fullscreen, false);
+fn init(core: *Mod, entities: *mach.Entities.Mod) !void {
+    // TODO: this needs to be removed.
+    const options: InitOptions = .{
+        .allocator = std.heap.c_allocator,
+    };
+    const allocator = options.allocator;
+
+    // TODO: fix all leaks and use options.allocator
+    try mach.sysgpu.Impl.init(allocator, .{});
+
+    const main_window = try entities.new();
+    try core.set(main_window, .fullscreen, false);
+    try core.set(main_window, .width, 1920 / 2);
+    try core.set(main_window, .height, 1080 / 2);
 
     // Copy window title into owned buffer.
-    if (options.title.len < state.title.len) {
-        @memcpy(state.title[0..options.title.len], options.title);
-        state.title[options.title.len] = 0;
+    var title: [256:0]u8 = undefined;
+    if (options.title.len < title.len) {
+        @memcpy(title[0..options.title.len], options.title);
+        title[options.title.len] = 0;
     }
 
+    core.init(.{
+        .allocator = allocator,
+        .main_window = main_window,
+
+        // TODO: remove undefined initialization (disgusting!)
+        .platform = undefined,
+
+        // TODO: these should not be state, they should be components.
+        .title = title,
+        .frame = undefined,
+        .input = undefined,
+        .instance = undefined,
+        .adapter = undefined,
+        .device = undefined,
+        .queue = undefined,
+        .surface = undefined,
+        .swap_chain = undefined,
+        .descriptor = undefined,
+    });
+    const state = core.state();
     try Platform.init(&state.platform, options);
 
     state.instance = gpu.createInstance(null) orelse {
@@ -222,8 +302,63 @@ fn init(core: *Mod, entities: *mach.Entities.Mod, options: InitOptions) !void {
     try state.input.start();
 }
 
-pub inline fn deinit(entities: *mach.Entities.Mod, core: *Mod) !void {
+pub fn start(core: *Mod) !void {
+    if (core.state().on_tick == null) @panic("core.state().on_tick callback system must be registered");
+    if (core.state().on_exit == null) @panic("core.state().on_exit callback system must be registered");
+
+    // Signal that mach.Core has started.
+    core.schedule(.started);
+
+    // Schedule the next app tick to run.
+    core.scheduleAny(core.state().on_tick.?);
+
+    // If the user doesn't want mach.Core to take control of the main loop, we bail out - the next
+    // app tick is already scheduled to run in the future and they'll .present_frame to return
+    // control to us later.
+    if (non_blocking) {
+        if (!supports_non_blocking) std.debug.panic(
+            "mach.Core: platform {s} does not support non_blocking=true mode.",
+            .{@tagName(build_options.core_platform)},
+        );
+        return;
+    }
+
+    // The user wants mach.Core to take control of the main loop.
+
+    // TODO: we already have stack space since we are an executing system, so in theory we could
+    // deduplicate this allocation and just use 'our current stack space' - but accessing it from
+    // the dispatcher is tricky.
+    const stack_space = try core.state().allocator.alloc(u8, 8 * 1024 * 1024);
+
+    if (supports_non_blocking) {
+        while (mach.mods.mod.mach_core.state != .exited) {
+            try mach.mods.dispatchUntil(stack_space, .mach_core, .frame_finished);
+        }
+        // Don't return, because Platform.run wouldn't either (marked noreturn due to underlying
+        // platform APIs never returning.)
+        std.process.exit(1);
+    } else {
+        // Platform drives the main loop.
+        Platform.run(platform_update_callback, .{ &mach.mods.mod.mach_core, stack_space });
+
+        // Platform.run should be marked noreturn, so this shouldn't ever run. But just in case we
+        // accidentally introduce a different Platform.run in the future, we put an exit here for
+        // good measure.
+        std.process.exit(1);
+    }
+}
+
+fn platform_update_callback(core: *Mod, stack_space: []u8) !bool {
+    // Execute systems until .mach_core.frame_finished is dispatched, signalling a frame was
+    // finished.
+    try mach.mods.dispatchUntil(stack_space, .mach_core, .frame_finished);
+
+    return core.state().state != .exited;
+}
+
+pub fn deinit(entities: *mach.Entities.Mod, core: *Mod) !void {
     const state = core.state();
+    state.state = .exited;
 
     var q = try entities.query(.{
         .titles = Mod.read(.title),
@@ -377,7 +512,7 @@ pub const Key = enum {
     kp_7,
     kp_8,
     kp_9,
-    kp_decimal,  
+    kp_decimal,
     kp_comma,
     kp_equal,
     kp_enter,
@@ -814,6 +949,20 @@ fn presentFrame(core: *Mod, entities: *mach.Entities.Mod) !void {
     try core.set(state.main_window, .width, state.platform.size.width);
     try core.set(state.main_window, .height, state.platform.size.height);
 
+    // Signal that the frame was finished.
+    core.schedule(.frame_finished);
+
+    switch (core.state().state) {
+        .running => core.scheduleAny(core.state().on_tick.?),
+        .exiting => {
+            core.scheduleAny(core.state().on_exit.?);
+            core.state().state = .deinitializing;
+        },
+        .deinitializing => {},
+        .exited => @panic("application not running"),
+    }
+
+    // Record to frame rate frequency monitor that a frame was finished.
     state.frame.tick();
 }
 
@@ -839,7 +988,7 @@ pub fn printTitle(
 }
 
 fn exit(core: *Mod) void {
-    core.state().should_close = true;
+    core.state().state = .exiting;
 }
 
 pub const RequestAdapterResponse = struct {

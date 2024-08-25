@@ -1,5 +1,4 @@
 const std = @import("std");
-
 const mach = @import("mach");
 
 // The global list of Mach modules registered for use in our application.
@@ -9,12 +8,18 @@ pub const modules = .{
     @import("Renderer.zig"),
 };
 
+// TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
-    var app = try mach.App.init(allocator, .app);
-    defer app.deinit(allocator);
-    try app.run(.{ .allocator = allocator });
+    // Initialize module system
+    try mach.mods.init(allocator);
+
+    // Schedule .app.start to run.
+    mach.mods.schedule(.app, .start);
+
+    // Dispatch systems forever or until there are none left to dispatch. If your app uses mach.Core
+    // then this will block forever and never return.
+    const stack_space = try allocator.alloc(u8, 8 * 1024 * 1024);
+    try mach.mods.dispatch(stack_space, .{});
 }
